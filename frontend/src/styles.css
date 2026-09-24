@@ -1394,6 +1394,15 @@ textarea:focus {
   margin-right: 6px;
 }
 
+.batch-warn {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--danger);
+}
+
 /* ---------- 侧栏 ---------- */
 
 .sidebar {

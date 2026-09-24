@@ -41,9 +41,12 @@ const docList = [
 
 // 服务器侧创建结果记录
 const created = []
+const batchCreated = []
 
 // 被挂起的 GET /documents/:id：id -> {resolve, promise}
 let held = new Map()
+// 被挂起的 GET /documents/:id/search：id -> {resolve, promise}
+let heldSearch = new Map()
 
 function hold(id) {
   let resolve
@@ -60,6 +63,42 @@ function release(id) {
     h.resolve()
     held.delete(id)
   }
+}
+
+function holdSearch(id, query) {
+  let resolve
+  const promise = new Promise((r) => {
+    resolve = () =>
+      r({ ok: true, status: 200, json: () => Promise.resolve(searchBody(id, query)) })
+  })
+  heldSearch.set(`${id}:${query}`, { resolve, promise })
+}
+
+function releaseSearch(id, query) {
+  const key = `${id}:${query}`
+  const h = heldSearch.get(key)
+  if (h) {
+    h.resolve()
+    heldSearch.delete(key)
+  }
+}
+
+// 与后端一致的字面检索（含彼此重叠命中）
+function searchBody(id, query) {
+  const content = DOCS[id].document.content
+  const matches = []
+  let pos = content.indexOf(query)
+  while (pos !== -1) {
+    matches.push({
+      start: pos,
+      end: pos + query.length,
+      text: content.slice(pos, pos + query.length),
+      before: content.slice(Math.max(0, pos - 20), pos),
+      after: content.slice(pos + query.length, pos + query.length + 20),
+    })
+    pos = content.indexOf(query, pos + 1)
+  }
+  return { document_id: id, query, matches }
 }
 
 function jsonRes(body) {
@@ -94,6 +133,27 @@ globalThis.fetch = async (url, options = {}) => {
     const body = JSON.parse(options.body)
     created.push(body)
     return jsonRes({ id: 100 + created.length, ...body })
+  }
+  const searchMatch = path.match(/^\/api\/documents\/(\d+)\/search$/)
+  if (searchMatch && method === 'GET') {
+    const id = Number(searchMatch[1])
+    const query = u.searchParams.get('query')
+    const key = `${id}:${query}`
+    if (heldSearch.has(key)) return heldSearch.get(key).promise
+    return jsonRes(searchBody(id, query))
+  }
+  if (path === '/api/codings/batch' && method === 'POST') {
+    const body = JSON.parse(options.body)
+    batchCreated.push(body)
+    return jsonRes({
+      created: body.items.map((it, i) => ({
+        id: 200 + batchCreated.length * 100 + i,
+        start: it.start,
+        end: it.end,
+      })),
+      skipped: [],
+      codings: [],
+    })
   }
   // 统计类端点一律给空结构，避免干扰
   if (path.endsWith('/cooccurrence')) return jsonRes({ document_id: 0, codes: [], pairs: [] })
@@ -252,6 +312,89 @@ await act(async () => {
   await flush(40)
 })
 check('B 加载完成且无弹窗残留', container.textContent.includes('BBBBBBBBBB') && !container.querySelector('.modal'))
+
+// ---------- 用例 5：A 检索后改关键词为 B（不重新检索），A 的命中立即消失且不可批量写入 ----------
+await switchDoc(1)
+
+const searchInput = () => container.querySelector('.search-bar input')
+const searchBtn = () => container.querySelector('.search-bar .primary-btn')
+const batchBtn = () => container.querySelector('.apply-row .primary-btn')
+
+await act(async () => {
+  setNative(searchInput(), 'AA') // 'AAA…' 中重叠命中 [0,2)、[1,3)
+  searchBtn().click()
+  await flush(20)
+})
+check('检索 AA 后展示 2 处命中（含重叠）', !!container.textContent.match(/「AA」命中 2 处/))
+
+await act(async () => {
+  setNative(searchInput(), 'BB') // 仅改输入，不提交检索
+  await flush(10)
+})
+check('改关键词后 A 的命中立即清除', !container.querySelector('.match-list'))
+check('改关键词后批量提交按钮不再渲染（无法拿旧命中写入）', !batchBtn())
+check('改关键词后不残留 A 的命中计数', !container.textContent.includes('「AA」命中'))
+
+// 迟到的 AA 响应也不得恢复旧命中（请求发出时输入仍是 AA，挂起后改词再放行）
+await act(async () => {
+  setNative(searchInput(), 'AA')
+  await flush(5)
+  holdSearch(1, 'AA')
+  searchBtn().click()
+  await flush(10)
+  setNative(searchInput(), 'BB') // 检索在途即改词
+  await flush(5)
+  releaseSearch(1, 'AA') // A 检索迟到响应
+  await flush(20)
+})
+check('A 迟到响应不得在 B 名下恢复旧命中', !container.querySelector('.match-list'))
+check('迟到响应后输入仍是 B', searchInput().value === 'BB', searchInput().value)
+check('迟到响应后无批量提交入口', !batchBtn())
+
+// ---------- 用例 6：切文档时在途检索的迟到响应不得落到新文档 ----------
+await act(async () => {
+  setNative(searchInput(), 'AA')
+  await flush(5)
+  holdSearch(1, 'AA')
+  searchBtn().click()
+  await flush(10)
+})
+hold(2)
+await switchDoc(2)
+check('切文档加载期间不显示旧命中', !container.querySelector('.match-list'))
+await act(async () => {
+  releaseSearch(1, 'AA') // 旧文档检索迟到
+  await flush(20)
+  release(2)
+  await flush(30)
+})
+check('旧文档迟到检索不落到新文档', !container.querySelector('.match-list'))
+check('输入框随文档切换清空', searchInput().value === '', searchInput().value)
+
+// ---------- 用例 7：在当前文档正常检索并批量写入，目标与关键词绑定 ----------
+const batchBefore = batchCreated.length
+await act(async () => {
+  setNative(searchInput(), 'BBBB') // 'BBBBBBBBBB' 中重叠命中 7 处
+  searchBtn().click()
+  await flush(20)
+})
+check('当前文档检索展示 7 处重叠命中', !!container.textContent.match(/「BBBB」命中 7 处/))
+await act(async () => {
+  const codeSelect = container.querySelector('.apply-row select')
+  setNative(codeSelect, '7')
+  await flush(5)
+  batchBtn().click()
+  await flush(30)
+})
+check(
+  '批量写入目标为当前文档且区间来自该次检索',
+  batchCreated.length === batchBefore + 1 &&
+    batchCreated[batchCreated.length - 1].document_id === 2 &&
+    JSON.stringify(batchCreated[batchCreated.length - 1].items) ===
+      JSON.stringify([0, 1, 2, 3, 4, 5, 6].map((s) => ({ start: s, end: s + 4 }))),
+  batchCreated[batchCreated.length - 1]
+)
+check('结果提示绑定已检索关键词', container.querySelector('.batch-result')?.textContent.includes('「BBBB」'))
 
 if (failures.length) {
   console.error(`\n${failures.length} 项失败`)
